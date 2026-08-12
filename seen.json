@@ -712,6 +712,20 @@
    "first_seen": "2026-08-12T07:03:27+00:00",
    "notification_sent": true,
    "matched": true
+  },
+  "6331622": {
+   "url": "https://bina.az/items/6331622",
+   "price": 179999,
+   "first_seen": "2026-08-12T07:07:33+00:00",
+   "notification_sent": true,
+   "matched": true
+  },
+  "6369007": {
+   "url": "https://bina.az/items/6369007",
+   "price": 158000,
+   "first_seen": "2026-08-12T07:07:33+00:00",
+   "notification_sent": true,
+   "matched": true
   }
  }
 }
