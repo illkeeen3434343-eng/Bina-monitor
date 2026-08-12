@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bina.az -> Telegram apartment monitor (single-run edition for GitHub Actions)."""
+"""Bina.az -> Telegram apartment monitor (self-diagnosing single-run edition)."""
 import datetime as dt
 import html
 import json
@@ -192,10 +192,13 @@ def _node_to_listing(node):
 
 
 def fetch_newest():
+    """Return newest listings. Raises with a clear reason if bina can't be read."""
     out = []
     cursor = None
+    last_status = None
     for _ in range(SCAN_PAGES):
         r = requests.get(GRAPHQL_URL, params=_params(cursor), headers=HEADERS, timeout=30)
+        last_status = r.status_code
         if r.status_code != 200:
             log("bina.az HTTP", r.status_code, "- stopping this run")
             break
@@ -221,6 +224,8 @@ def fetch_newest():
         if not info.get("hasNextPage") or not info.get("endCursor"):
             break
         cursor = info["endCursor"]
+    if not out and last_status not in (200, None):
+        raise RuntimeError(f"bina.az returned HTTP {last_status}")
     return out
 
 
@@ -291,6 +296,38 @@ def notify(l):
     return tg_send_message(text)
 
 
+def process(newest, first_run, seen):
+    """Record listings; on later runs, notify new matches. Returns (seeded, notified)."""
+    now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+    f = build_filter(BINA_SEARCH_URL)
+    new_matches, seeded, notified = [], 0, 0
+
+    for l in newest:
+        idk = str(l["id"])
+        if idk in seen:
+            continue
+        if matches(l, f):
+            if first_run:
+                seen[idk] = {"url": l["url"], "price": l["price"], "first_seen": now,
+                             "notification_sent": True, "matched": True}
+                seeded += 1
+            else:
+                new_matches.append(l)
+        else:
+            seen[idk] = {"first_seen": now, "notification_sent": True, "matched": False}
+
+    if not first_run:
+        for l in new_matches:
+            if notify(l):
+                seen[str(l["id"])] = {"url": l["url"], "price": l["price"], "first_seen": now,
+                                      "notification_sent": True, "matched": True}
+                notified += 1
+                log("Notified:", l["id"], l.get("price"), l.get("location"))
+            else:
+                log("Send failed, will retry next run:", l["id"])
+    return seeded, notified
+
+
 def main():
     if not BOT_TOKEN or not CHAT_ID:
         log("ERROR: TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set as secrets.")
@@ -302,54 +339,43 @@ def main():
         state = {"listings": {}}
     seen = state["listings"]
 
+    fetch_error = None
+    newest = []
     try:
         newest = fetch_newest()
     except PersistedQueryError:
         tg_send_message(
             "⚠️ bina.az updated its site, so monitoring is paused until you refresh "
-            "the request signature. See the 'Refresh the hash' note. It resumes after you update monitor.py.")
+            "the request signature (persisted query hash). Ask for the refresh steps.")
         return
+    except Exception as e:
+        fetch_error = str(e)
+        log("Fetch failed:", e)
 
-    if not newest:
-        log("No listings fetched this run (transient). Will retry next run.")
-        return
-
-    now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
-    new_matches, seeded = [], 0
-
-    for l in newest:
-        idk = str(l["id"])
-        if idk in seen:
-            continue
-        if matches(l, build_filter(BINA_SEARCH_URL)):
-            if first_run:
-                seen[idk] = {"url": l["url"], "price": l["price"], "first_seen": now,
-                             "notification_sent": True, "matched": True}
-                seeded += 1
-            else:
-                new_matches.append(l)
-        else:
-            seen[idk] = {"first_seen": now, "notification_sent": True, "matched": False}
-
-    notified = 0
+    # ---- FIRST RUN: always report back so you know the bot is alive ----------
     if first_run:
-        log(f"First run: seeded {seeded} current matching listings (no spam).")
-        tg_send_message(
-            f"✅ <b>Monitoring started.</b>\nRecorded {seeded} current matching "
-            f"listing(s). From now on you'll only get brand-new ones.\n\n"
-            f"Scanned {len(newest)} newest listings this run.")
-    else:
-        for l in new_matches:
-            if notify(l):
-                seen[str(l["id"])] = {"url": l["url"], "price": l["price"],
-                                      "first_seen": now, "notification_sent": True, "matched": True}
-                notified += 1
-                log("Notified:", l["id"], l.get("price"), l.get("location"))
-            else:
-                log("Send failed, will retry next run:", l["id"])
+        if newest:
+            seeded, _ = process(newest, first_run=True, seen=seen)
+            save_state(state)
+            tg_send_message(
+                f"✅ <b>Monitoring started.</b>\nScanned {len(newest)} newest listings and "
+                f"recorded {seeded} that match your search. From now on you'll get a message "
+                f"only when a brand-new matching apartment appears.")
+        else:
+            tg_send_message(
+                "🟡 <b>Bot is running</b>, but it could not read bina.az on this attempt"
+                + (f"\nReason: {html.escape(fetch_error)}" if fetch_error else "")
+                + ".\nIt will automatically retry every 5 minutes. If this keeps happening, "
+                "tell me the reason shown above.")
+        return
 
+    # ---- LATER RUNS ----------------------------------------------------------
+    if not newest:
+        log("Empty fetch on a later run; will retry next time.", fetch_error or "")
+        return
+    _, notified = process(newest, first_run=False, seen=seen)
     save_state(state)
-    log(f"Done. scanned={len(newest)} new_matches={len(new_matches)} notified={notified} seen_total={len(seen)}")
+    log(f"Done. scanned={len(newest)} notified={notified} seen_total={len(seen)}")
 
 
 if __name__ == "__main__":
