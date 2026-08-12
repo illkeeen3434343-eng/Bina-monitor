@@ -33,3 +33,4 @@ jobs:
           else
             echo "No state change."
           fi
+.
