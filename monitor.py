@@ -1,18 +1,16 @@
 #!/usr/bin/env python3
 """
-Bina.az -> Telegram apartment monitor (resilient single-run edition).
+Bina.az -> Telegram apartment monitor (current-API edition, Aug 2026).
 
-Reads the newest listings for your saved search and messages you about brand-new
-ones. It tries Bina's fast GraphQL API first; if that is unavailable (e.g. the
-request signature has expired after a site update), it automatically falls back
-to reading Bina's normal search-results web page, which needs no signature and
-already applies your filters server-side. It always reports what it did.
+Speaks bina.az's current GraphQL contract: server-side filters via the query
+(roomIds, locationIds, priceTo, areaFrom, hasBillOfSale, hasMortgage, ...) and the
+new ESItem response shape (price.total, preview.f460x345, string ids). It reads the
+newest matching listings and messages you about brand-new ones, exactly once.
 """
 import datetime as dt
 import html
 import json
 import os
-import re
 import sys
 from urllib.parse import parse_qs, urlparse
 
@@ -22,15 +20,20 @@ import requests
 BINA_SEARCH_URL = os.environ.get("BINA_SEARCH_URL", (
     "https://bina.az/baki/alqi-satqi/menziller?room_ids%5B%5D=2&room_ids%5B%5D=3&room_ids%5B%5D=4&price_to=190000&area_from=55&has_bill_of_sale=true&has_mortgage=true&floor_first=false&floor_last=false&location_ids%5B%5D=8&location_ids%5B%5D=51&location_ids%5B%5D=2&location_ids%5B%5D=33&location_ids%5B%5D=54&location_ids%5B%5D=4&location_ids%5B%5D=52&location_ids%5B%5D=53&location_ids%5B%5D=1&location_ids%5B%5D=259&location_ids%5B%5D=314&location_ids%5B%5D=100&location_ids%5B%5D=99&location_ids%5B%5D=233&location_ids%5B%5D=68&location_ids%5B%5D=74&location_ids%5B%5D=69&location_ids%5B%5D=103&location_ids%5B%5D=246&location_ids%5B%5D=186&location_ids%5B%5D=376&location_ids%5B%5D=25&location_ids%5B%5D=138&location_ids%5B%5D=152&location_ids%5B%5D=26&location_ids%5B%5D=175&location_ids%5B%5D=135&location_ids%5B%5D=136&location_ids%5B%5D=16&location_ids%5B%5D=36"
 ))
+# Baku = "1", apartments-for-sale category = "1" (matches the /baki/alqi-satqi/menziller path).
+CITY_ID = os.environ.get("BINA_CITY_ID", "1")
+CATEGORY_ID = os.environ.get("BINA_CATEGORY_ID", "1")
+
+# Current request signature used by bina.az's own website. If the bot ever reports
+# it stopped working, capture a fresh one from the browser Network tab (see README).
 PERSISTED_HASH = os.environ.get("BINA_PERSISTED_HASH",
-    "872e9c694c34b6674514d48e9dcf1b46241d3d79f365ddf20d138f18e74554c5")
+    "b781511a943a4d710eefdf811a24dd4ae353e55d836952603ce0b37fde97d073")
 
 GRAPHQL_URL = "https://bina.az/graphql"
 OPERATION = "SearchItems"
 SORT = "BUMPED_AT_DESC"
 PAGE_SIZE = 16
 SCAN_PAGES = int(os.environ.get("SCAN_PAGES", "6"))
-HTML_PAGES = int(os.environ.get("HTML_PAGES", "2"))   # search-page fallback depth
 STATE_FILE = os.environ.get("STATE_FILE", "seen.json")
 MAX_SEEN = 6000
 SEND_PHOTOS = os.environ.get("SEND_PHOTOS", "true").lower() == "true"
@@ -38,18 +41,15 @@ SEND_PHOTOS = os.environ.get("SEND_PHOTOS", "true").lower() == "true"
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
-BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-              "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
-API_HEADERS = {
-    "User-Agent": BROWSER_UA, "Accept": "*/*",
+HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36"),
+    "Accept": "*/*",
     "Accept-Language": "az,en-US;q=0.9,en;q=0.8,ru;q=0.7",
     "Content-Type": "application/json",
-    "Referer": "https://bina.az/alqi-satqi/menziller", "Origin": "https://bina.az",
-}
-HTML_HEADERS = {
-    "User-Agent": BROWSER_UA,
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "az,en-US;q=0.9,en;q=0.8,ru;q=0.7",
+    "Referer": "https://bina.az/baki/alqi-satqi/menziller",
+    "Origin": "https://bina.az",
+    "x-platform": "desktop",
 }
 
 
@@ -91,77 +91,60 @@ def tg_send_photo(photo_url, caption):
 
 
 # --------------------------------------------------------------------------- #
-# Filter parsed from the search URL (used only for GraphQL results; the HTML
-# page already applies the filter server-side)
+# Build the server-side GraphQL filter from your bina.az search URL
 # --------------------------------------------------------------------------- #
-def build_filter(url):
+def build_filter_variables(url):
     q = parse_qs(urlparse(url).query)
 
     def one(k):
         v = q.get(k)
         return v[0] if v else None
 
-    def as_int(v):
+    def as_bool(v):
+        return str(v).lower() in ("1", "true", "yes", "on") if v is not None else None
+
+    def as_num(v):
         try:
-            return int(v)
+            f = float(v)
+            return int(f) if f.is_integer() else f
         except (TypeError, ValueError):
             return None
 
-    def as_bool(v):
-        return None if v is None else str(v).lower() in ("1", "true", "yes", "on")
+    filt = {"cityId": CITY_ID, "categoryId": CATEGORY_ID, "leased": False}
 
-    return {
-        "room_ids": {as_int(v) for v in q.get("room_ids[]", []) if as_int(v) is not None},
-        "location_ids": {as_int(v) for v in q.get("location_ids[]", []) if as_int(v) is not None},
-        "price_from": as_int(one("price_from")), "price_to": as_int(one("price_to")),
-        "area_from": float(one("area_from")) if one("area_from") else None,
-        "area_to": float(one("area_to")) if one("area_to") else None,
-        "has_bill_of_sale": as_bool(one("has_bill_of_sale")),
-        "has_mortgage": as_bool(one("has_mortgage")),
-        "not_first_floor": as_bool(one("floor_first")) is True,
-        "not_last_floor": as_bool(one("floor_last")) is True,
-    }
-
-
-def matches(l, f):
-    if f["room_ids"] and l.get("rooms") not in f["room_ids"]:
-        return False
-    price = l.get("price")
-    if f["price_to"] is not None and (price is None or price > f["price_to"]):
-        return False
-    if f["price_from"] is not None and (price is None or price < f["price_from"]):
-        return False
-    area = l.get("area")
-    if f["area_from"] is not None and (area is None or area < f["area_from"]):
-        return False
-    if f["area_to"] is not None and (area is None or area > f["area_to"]):
-        return False
-    if f["has_bill_of_sale"] is True and l.get("has_bill_of_sale") is not True:
-        return False
-    if f["has_mortgage"] is True and l.get("has_mortgage") is not True:
-        return False
-    if f["location_ids"]:
-        lid = l.get("location_id")
-        if lid is None or int(lid) not in f["location_ids"]:
-            return False
-    floor, floors = l.get("floor"), l.get("floors")
-    if f["not_first_floor"] and floor is not None and floor <= 1:
-        return False
-    if f["not_last_floor"] and floor is not None and floors is not None and floor >= floors:
-        return False
-    return True
+    rooms = [str(v) for v in q.get("room_ids[]", []) if str(v).strip()]
+    if rooms:
+        filt["roomIds"] = rooms
+    locs = [str(v) for v in q.get("location_ids[]", []) if str(v).strip()]
+    if locs:
+        filt["locationIds"] = locs
+    if as_num(one("price_to")) is not None:
+        filt["priceTo"] = as_num(one("price_to"))
+    if as_num(one("price_from")) is not None:
+        filt["priceFrom"] = as_num(one("price_from"))
+    if as_num(one("area_from")) is not None:
+        filt["areaFrom"] = as_num(one("area_from"))
+    if as_num(one("area_to")) is not None:
+        filt["areaTo"] = as_num(one("area_to"))
+    if as_bool(one("has_bill_of_sale")) is not None:
+        filt["hasBillOfSale"] = as_bool(one("has_bill_of_sale"))
+    if as_bool(one("has_mortgage")) is not None:
+        filt["hasMortgage"] = as_bool(one("has_mortgage"))
+    filt["floorFirst"] = as_bool(one("floor_first")) is True
+    filt["floorLast"] = as_bool(one("floor_last")) is True
+    return filt
 
 
 # --------------------------------------------------------------------------- #
-# Source 1: GraphQL API
+# GraphQL request + parsing (current ESItem shape)
 # --------------------------------------------------------------------------- #
-def _params(cursor):
-    variables = {"first": PAGE_SIZE, "filter": {"leased": False}, "sort": SORT}
+def _params(filter_vars, cursor):
+    variables = {"first": PAGE_SIZE, "filter": filter_vars, "sort": SORT}
     if cursor:
         variables["cursor"] = cursor
     return {
         "operationName": OPERATION,
-        "variables": json.dumps(variables, separators=(",", ":")),
+        "variables": json.dumps(variables, separators=(",", ":"), ensure_ascii=False),
         "extensions": json.dumps(
             {"persistedQuery": {"version": 1, "sha256Hash": PERSISTED_HASH}},
             separators=(",", ":")),
@@ -173,47 +156,54 @@ def _node_to_listing(node):
         o = node.get(k)
         return o.get(fld) if isinstance(o, dict) else None
 
-    photos = node.get("photos") or []
-    photo = None
-    if photos and isinstance(photos[0], dict):
-        photo = photos[0].get("large") or photos[0].get("f460x345") or photos[0].get("thumbnail")
+    preview = node.get("preview") or {}
+    photo = preview.get("f460x345") or preview.get("thumbnail")
 
     area = sub("area", "value")
     try:
         area = float(area) if area is not None else None
     except (TypeError, ValueError):
         area = None
-    price = sub("price", "value")
+
+    price = sub("price", "total")
     try:
         price = int(float(price)) if price is not None else None
     except (TypeError, ValueError):
         price = None
+
+    loc_id = sub("location", "id")
+    try:
+        loc_id = int(loc_id) if loc_id is not None else None
+    except (TypeError, ValueError):
+        loc_id = None
 
     path = node.get("path")
     return {
         "id": int(node["id"]), "rooms": node.get("rooms"), "area": area,
         "area_units": sub("area", "units") or "m²", "floor": node.get("floor"),
         "floors": node.get("floors"), "price": price,
-        "currency": sub("price", "currency") or "AZN", "location_id": sub("location", "id"),
+        "currency": sub("price", "currency") or "AZN", "location_id": loc_id,
         "location": sub("location", "fullName") or sub("location", "name") or sub("city", "name"),
         "has_bill_of_sale": node.get("hasBillOfSale"), "has_mortgage": node.get("hasMortgage"),
         "has_repair": node.get("hasRepair"), "updated_at": node.get("updatedAt"),
         "url": f"https://bina.az{path}" if path else f"https://bina.az/items/{node['id']}",
-        "photo": photo, "html_only": False,
+        "photo": photo,
     }
 
 
-def fetch_graphql():
-    """Raise with a precise reason if the API can't be used; else return listings."""
+def fetch_listings():
+    """Return newest matching listings. Raise with a clear reason on failure."""
+    filter_vars = build_filter_variables(BINA_SEARCH_URL)
     out, cursor = [], None
     for _ in range(SCAN_PAGES):
-        r = requests.get(GRAPHQL_URL, params=_params(cursor), headers=API_HEADERS, timeout=30)
+        r = requests.get(GRAPHQL_URL, params=_params(filter_vars, cursor),
+                         headers=HEADERS, timeout=30)
         if r.status_code != 200:
-            raise RuntimeError(f"GraphQL HTTP {r.status_code}")
+            raise RuntimeError(f"HTTP {r.status_code}")
         try:
             payload = r.json()
         except ValueError:
-            raise RuntimeError("GraphQL did not return JSON (blocked or challenge page)")
+            raise RuntimeError("response was not JSON (blocked or challenge page)")
         if payload.get("errors"):
             msg = "; ".join(str(e.get("message", e)) for e in payload["errors"])
             if "PersistedQueryNotFound" in msg or "PERSISTED_QUERY_NOT_FOUND" in msg:
@@ -222,7 +212,7 @@ def fetch_graphql():
         conn = (payload.get("data") or {}).get("itemsConnection")
         if not conn:
             keys = ",".join((payload.get("data") or {}).keys()) or "none"
-            raise RuntimeError(f"GraphQL: no itemsConnection (data keys: {keys})")
+            raise RuntimeError(f"no itemsConnection (data keys: {keys})")
         for edge in conn.get("edges", []):
             node = edge.get("node")
             if node and node.get("id") is not None:
@@ -238,63 +228,41 @@ def fetch_graphql():
 
 
 # --------------------------------------------------------------------------- #
-# Source 2: normal search web page (no signature needed; filters applied by site)
+# Optional safety-net client-side filter (server already filters; this double-checks)
 # --------------------------------------------------------------------------- #
-def fetch_html():
-    """Read the search results page(s) and extract listing ids + links."""
-    found, seen_ids = [], set()
-    base = BINA_SEARCH_URL
-    for page in range(1, HTML_PAGES + 1):
-        url = base if page == 1 else base + ("&" if "?" in base else "?") + f"page={page}"
-        r = requests.get(url, headers=HTML_HEADERS, timeout=30)
-        if r.status_code != 200:
-            if page == 1:
-                raise RuntimeError(f"search page HTTP {r.status_code}")
-            break
-        text = r.text
-        matches_on_page = 0
-        for m in re.finditer(r'/items/(\d+)(-[A-Za-z0-9\-]+)?', text):
-            iid = m.group(1)
-            if iid in seen_ids:
-                continue
-            seen_ids.add(iid)
-            slug = m.group(2) or ""
-            title = slug.lstrip("-").replace("-", " ").strip() or None
-            found.append({
-                "id": int(iid), "url": "https://bina.az" + m.group(0),
-                "title": title, "html_only": True, "price": None, "rooms": None,
-                "area": None, "area_units": "m²", "floor": None, "floors": None,
-                "currency": "AZN", "location": None, "location_id": None,
-                "has_bill_of_sale": None, "has_mortgage": None, "has_repair": None,
-                "updated_at": None, "photo": None,
-            })
-            matches_on_page += 1
-        if matches_on_page == 0 and page == 1:
-            raise RuntimeError("search page had no listings (JS-only page or blocked)")
-        if matches_on_page == 0:
-            break
-    return found
+def build_check_filter(url):
+    q = parse_qs(urlparse(url).query)
+
+    def one(k):
+        v = q.get(k)
+        return v[0] if v else None
+
+    def as_int(v):
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return None
+
+    return {
+        "room_ids": {as_int(v) for v in q.get("room_ids[]", []) if as_int(v) is not None},
+        "location_ids": {as_int(v) for v in q.get("location_ids[]", []) if as_int(v) is not None},
+        "price_to": as_int(one("price_to")),
+        "area_from": float(one("area_from")) if one("area_from") else None,
+    }
 
 
-def fetch_listings():
-    """Return (listings, source_label). Raise RuntimeError if both sources fail."""
-    graphql_reason = None
-    try:
-        items = fetch_graphql()
-        if items:
-            return items, "API"
-        graphql_reason = "API returned 0 listings"
-    except PersistedQueryError as e:
-        graphql_reason = f"API signature expired ({e})"
-    except Exception as e:
-        graphql_reason = f"API: {e}"
-
-    log("Falling back to HTML page. Reason:", graphql_reason)
-    try:
-        items = fetch_html()
-        return items, f"web page (API unavailable: {graphql_reason})"
-    except Exception as e:
-        raise RuntimeError(f"{graphql_reason}; web page also failed: {e}")
+def passes_check(l, f):
+    if f["room_ids"] and l.get("rooms") not in f["room_ids"]:
+        return False
+    if f["price_to"] is not None and (l.get("price") is None or l["price"] > f["price_to"]):
+        return False
+    if f["area_from"] is not None and (l.get("area") is None or l["area"] < f["area_from"]):
+        return False
+    if f["location_ids"]:
+        lid = l.get("location_id")
+        if lid is None or lid not in f["location_ids"]:
+            return False
+    return True
 
 
 # --------------------------------------------------------------------------- #
@@ -323,7 +291,7 @@ def save_state(state):
 
 
 # --------------------------------------------------------------------------- #
-# Messages
+# Message
 # --------------------------------------------------------------------------- #
 def _fmt_published(iso):
     if not iso:
@@ -335,15 +303,6 @@ def _fmt_published(iso):
 
 
 def format_message(l):
-    if l.get("html_only"):
-        lines = ["🏠 <b>NEW APARTMENT FOUND</b>", ""]
-        if l.get("title"):
-            lines.append(f"📝 {html.escape(l['title'])}")
-        lines.append("")
-        lines.append(f'🔗 <a href="{html.escape(l["url"])}">Open listing</a>')
-        lines.append("<i>(open the link for price, photos and full details)</i>")
-        return "\n".join(lines)
-
     lines = ["🏠 <b>NEW APARTMENT FOUND</b>", ""]
     if l.get("price") is not None:
         lines.append(f"💰 <b>Price:</b> {l['price']:,} {l['currency']}")
@@ -378,26 +337,24 @@ def notify(l):
 # --------------------------------------------------------------------------- #
 # Core
 # --------------------------------------------------------------------------- #
-def process(items, first_run, seen, source_is_html):
+def process(items, first_run, seen):
     now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
-    f = build_filter(BINA_SEARCH_URL)
+    check = build_check_filter(BINA_SEARCH_URL)
     new_matches, seeded, notified = [], 0, 0
 
     for l in items:
         idk = str(l["id"])
         if idk in seen:
             continue
-        # HTML results are already filtered by the website; API results we filter here.
-        is_match = True if source_is_html else matches(l, f)
-        if is_match:
-            if first_run:
-                seen[idk] = {"url": l["url"], "price": l.get("price"), "first_seen": now,
-                             "notification_sent": True, "matched": True}
-                seeded += 1
-            else:
-                new_matches.append(l)
-        else:
+        if not passes_check(l, check):
             seen[idk] = {"first_seen": now, "notification_sent": True, "matched": False}
+            continue
+        if first_run:
+            seen[idk] = {"url": l["url"], "price": l.get("price"), "first_seen": now,
+                         "notification_sent": True, "matched": True}
+            seeded += 1
+        else:
+            new_matches.append(l)
 
     if not first_run:
         for l in new_matches:
@@ -405,7 +362,7 @@ def process(items, first_run, seen, source_is_html):
                 seen[str(l["id"])] = {"url": l["url"], "price": l.get("price"), "first_seen": now,
                                       "notification_sent": True, "matched": True}
                 notified += 1
-                log("Notified:", l["id"], l.get("url"))
+                log("Notified:", l["id"], l.get("price"), l.get("location"))
             else:
                 log("Send failed, will retry next run:", l["id"])
     return seeded, notified
@@ -423,33 +380,32 @@ def main():
     seen = state["listings"]
 
     try:
-        items, source = fetch_listings()
+        items = fetch_listings()
     except PersistedQueryError:
-        tg_send_message("⚠️ bina.az updated its site and the web-page fallback also failed. "
-                        "Tell me and I'll adjust the reader.")
+        tg_send_message("⚠️ bina.az updated its site and the saved request signature expired. "
+                        "Capture a fresh one from the browser Network tab (README) and update "
+                        "BINA_PERSISTED_HASH. Monitoring is paused until then.")
         return
     except Exception as e:
         if first_run:
             tg_send_message("🟡 <b>Bot is running</b>, but it could not read bina.az yet.\n"
                             f"Reason: {html.escape(str(e))}\n"
-                            "It retries every 5 minutes. Send me this reason if it persists.")
+                            "It retries every 5 minutes.")
         else:
             log("Fetch failed on later run:", e)
         return
 
-    source_is_html = source.startswith("web page")
-
     if first_run:
-        seeded, _ = process(items, True, seen, source_is_html)
+        seeded, _ = process(items, True, seen)
         save_state(state)
-        tg_send_message(f"✅ <b>Monitoring started</b> (via {html.escape(source)}).\n"
-                        f"Recorded {seeded} current listing(s). From now on you'll get a "
-                        f"message only when a brand-new matching apartment appears.")
+        tg_send_message(f"✅ <b>Monitoring started.</b>\nScanned {len(items)} newest listings and "
+                        f"recorded {seeded} matching your search. From now on you'll get a message "
+                        f"only when a brand-new matching apartment appears.")
         return
 
-    _, notified = process(items, False, seen, source_is_html)
+    _, notified = process(items, False, seen)
     save_state(state)
-    log(f"Done via {source}. scanned={len(items)} notified={notified} seen_total={len(seen)}")
+    log(f"Done. scanned={len(items)} notified={notified} seen_total={len(seen)}")
 
 
 if __name__ == "__main__":
