@@ -733,6 +733,13 @@
    "first_seen": "2026-08-12T07:10:21+00:00",
    "notification_sent": true,
    "matched": true
+  },
+  "6016663": {
+   "url": "https://bina.az/items/6016663",
+   "price": 163000,
+   "first_seen": "2026-08-12T07:20:22+00:00",
+   "notification_sent": true,
+   "matched": true
   }
  }
 }
