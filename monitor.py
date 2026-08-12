@@ -1,9 +1,18 @@
 #!/usr/bin/env python3
-"""Bina.az -> Telegram apartment monitor (self-diagnosing single-run edition)."""
+"""
+Bina.az -> Telegram apartment monitor (resilient single-run edition).
+
+Reads the newest listings for your saved search and messages you about brand-new
+ones. It tries Bina's fast GraphQL API first; if that is unavailable (e.g. the
+request signature has expired after a site update), it automatically falls back
+to reading Bina's normal search-results web page, which needs no signature and
+already applies your filters server-side. It always reports what it did.
+"""
 import datetime as dt
 import html
 import json
 import os
+import re
 import sys
 from urllib.parse import parse_qs, urlparse
 
@@ -21,6 +30,7 @@ OPERATION = "SearchItems"
 SORT = "BUMPED_AT_DESC"
 PAGE_SIZE = 16
 SCAN_PAGES = int(os.environ.get("SCAN_PAGES", "6"))
+HTML_PAGES = int(os.environ.get("HTML_PAGES", "2"))   # search-page fallback depth
 STATE_FILE = os.environ.get("STATE_FILE", "seen.json")
 MAX_SEEN = 6000
 SEND_PHOTOS = os.environ.get("SEND_PHOTOS", "true").lower() == "true"
@@ -28,14 +38,18 @@ SEND_PHOTOS = os.environ.get("SEND_PHOTOS", "true").lower() == "true"
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
-HEADERS = {
-    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                   "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
-    "Accept": "*/*",
+BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+API_HEADERS = {
+    "User-Agent": BROWSER_UA, "Accept": "*/*",
     "Accept-Language": "az,en-US;q=0.9,en;q=0.8,ru;q=0.7",
     "Content-Type": "application/json",
-    "Referer": "https://bina.az/alqi-satqi/menziller",
-    "Origin": "https://bina.az",
+    "Referer": "https://bina.az/alqi-satqi/menziller", "Origin": "https://bina.az",
+}
+HTML_HEADERS = {
+    "User-Agent": BROWSER_UA,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "az,en-US;q=0.9,en;q=0.8,ru;q=0.7",
 }
 
 
@@ -47,12 +61,14 @@ class PersistedQueryError(Exception):
     pass
 
 
+# --------------------------------------------------------------------------- #
+# Telegram
+# --------------------------------------------------------------------------- #
 def tg_send_message(text):
     try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML",
-                  "disable_web_page_preview": False}, timeout=30)
+        r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                          json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML",
+                                "disable_web_page_preview": False}, timeout=30)
         if r.status_code == 200:
             return True
         log("Telegram sendMessage failed:", r.status_code, r.text[:200])
@@ -64,24 +80,25 @@ def tg_send_message(text):
 
 def tg_send_photo(photo_url, caption):
     try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
-            json={"chat_id": CHAT_ID, "photo": photo_url, "caption": caption,
-                  "parse_mode": "HTML"}, timeout=30)
+        r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
+                          json={"chat_id": CHAT_ID, "photo": photo_url, "caption": caption,
+                                "parse_mode": "HTML"}, timeout=30)
         if r.status_code == 200:
             return True
-        log("sendPhoto failed:", r.status_code, "-> text fallback")
         return tg_send_message(caption)
-    except requests.RequestException as e:
-        log("sendPhoto error:", e, "-> text fallback")
+    except requests.RequestException:
         return tg_send_message(caption)
 
 
+# --------------------------------------------------------------------------- #
+# Filter parsed from the search URL (used only for GraphQL results; the HTML
+# page already applies the filter server-side)
+# --------------------------------------------------------------------------- #
 def build_filter(url):
     q = parse_qs(urlparse(url).query)
 
-    def one(key):
-        v = q.get(key)
+    def one(k):
+        v = q.get(k)
         return v[0] if v else None
 
     def as_int(v):
@@ -96,8 +113,7 @@ def build_filter(url):
     return {
         "room_ids": {as_int(v) for v in q.get("room_ids[]", []) if as_int(v) is not None},
         "location_ids": {as_int(v) for v in q.get("location_ids[]", []) if as_int(v) is not None},
-        "price_from": as_int(one("price_from")),
-        "price_to": as_int(one("price_to")),
+        "price_from": as_int(one("price_from")), "price_to": as_int(one("price_to")),
         "area_from": float(one("area_from")) if one("area_from") else None,
         "area_to": float(one("area_to")) if one("area_to") else None,
         "has_bill_of_sale": as_bool(one("has_bill_of_sale")),
@@ -107,28 +123,28 @@ def build_filter(url):
     }
 
 
-def matches(listing, f):
-    if f["room_ids"] and listing.get("rooms") not in f["room_ids"]:
+def matches(l, f):
+    if f["room_ids"] and l.get("rooms") not in f["room_ids"]:
         return False
-    price = listing.get("price")
+    price = l.get("price")
     if f["price_to"] is not None and (price is None or price > f["price_to"]):
         return False
     if f["price_from"] is not None and (price is None or price < f["price_from"]):
         return False
-    area = listing.get("area")
+    area = l.get("area")
     if f["area_from"] is not None and (area is None or area < f["area_from"]):
         return False
     if f["area_to"] is not None and (area is None or area > f["area_to"]):
         return False
-    if f["has_bill_of_sale"] is True and listing.get("has_bill_of_sale") is not True:
+    if f["has_bill_of_sale"] is True and l.get("has_bill_of_sale") is not True:
         return False
-    if f["has_mortgage"] is True and listing.get("has_mortgage") is not True:
+    if f["has_mortgage"] is True and l.get("has_mortgage") is not True:
         return False
     if f["location_ids"]:
-        lid = listing.get("location_id")
+        lid = l.get("location_id")
         if lid is None or int(lid) not in f["location_ids"]:
             return False
-    floor, floors = listing.get("floor"), listing.get("floors")
+    floor, floors = l.get("floor"), l.get("floors")
     if f["not_first_floor"] and floor is not None and floor <= 1:
         return False
     if f["not_last_floor"] and floor is not None and floors is not None and floor >= floors:
@@ -136,6 +152,9 @@ def matches(listing, f):
     return True
 
 
+# --------------------------------------------------------------------------- #
+# Source 1: GraphQL API
+# --------------------------------------------------------------------------- #
 def _params(cursor):
     variables = {"first": PAGE_SIZE, "filter": {"leased": False}, "sort": SORT}
     if cursor:
@@ -150,9 +169,9 @@ def _params(cursor):
 
 
 def _node_to_listing(node):
-    def sub(key, field):
-        obj = node.get(key)
-        return obj.get(field) if isinstance(obj, dict) else None
+    def sub(k, fld):
+        o = node.get(k)
+        return o.get(fld) if isinstance(o, dict) else None
 
     photos = node.get("photos") or []
     photo = None
@@ -172,47 +191,38 @@ def _node_to_listing(node):
 
     path = node.get("path")
     return {
-        "id": int(node["id"]),
-        "rooms": node.get("rooms"),
-        "area": area,
-        "area_units": sub("area", "units") or "m²",
-        "floor": node.get("floor"),
-        "floors": node.get("floors"),
-        "price": price,
-        "currency": sub("price", "currency") or "AZN",
-        "location_id": sub("location", "id"),
+        "id": int(node["id"]), "rooms": node.get("rooms"), "area": area,
+        "area_units": sub("area", "units") or "m²", "floor": node.get("floor"),
+        "floors": node.get("floors"), "price": price,
+        "currency": sub("price", "currency") or "AZN", "location_id": sub("location", "id"),
         "location": sub("location", "fullName") or sub("location", "name") or sub("city", "name"),
-        "has_bill_of_sale": node.get("hasBillOfSale"),
-        "has_mortgage": node.get("hasMortgage"),
-        "has_repair": node.get("hasRepair"),
-        "updated_at": node.get("updatedAt"),
+        "has_bill_of_sale": node.get("hasBillOfSale"), "has_mortgage": node.get("hasMortgage"),
+        "has_repair": node.get("hasRepair"), "updated_at": node.get("updatedAt"),
         "url": f"https://bina.az{path}" if path else f"https://bina.az/items/{node['id']}",
-        "photo": photo,
+        "photo": photo, "html_only": False,
     }
 
 
-def fetch_newest():
-    """Return newest listings. Raises with a clear reason if bina can't be read."""
-    out = []
-    cursor = None
-    last_status = None
+def fetch_graphql():
+    """Raise with a precise reason if the API can't be used; else return listings."""
+    out, cursor = [], None
     for _ in range(SCAN_PAGES):
-        r = requests.get(GRAPHQL_URL, params=_params(cursor), headers=HEADERS, timeout=30)
-        last_status = r.status_code
+        r = requests.get(GRAPHQL_URL, params=_params(cursor), headers=API_HEADERS, timeout=30)
         if r.status_code != 200:
-            log("bina.az HTTP", r.status_code, "- stopping this run")
-            break
-        payload = r.json()
+            raise RuntimeError(f"GraphQL HTTP {r.status_code}")
+        try:
+            payload = r.json()
+        except ValueError:
+            raise RuntimeError("GraphQL did not return JSON (blocked or challenge page)")
         if payload.get("errors"):
             msg = "; ".join(str(e.get("message", e)) for e in payload["errors"])
-            if "PersistedQueryNotFound" in msg:
+            if "PersistedQueryNotFound" in msg or "PERSISTED_QUERY_NOT_FOUND" in msg:
                 raise PersistedQueryError(msg)
-            log("GraphQL error:", msg)
-            break
+            raise RuntimeError(f"GraphQL error: {msg}")
         conn = (payload.get("data") or {}).get("itemsConnection")
         if not conn:
-            log("No itemsConnection in response")
-            break
+            keys = ",".join((payload.get("data") or {}).keys()) or "none"
+            raise RuntimeError(f"GraphQL: no itemsConnection (data keys: {keys})")
         for edge in conn.get("edges", []):
             node = edge.get("node")
             if node and node.get("id") is not None:
@@ -224,11 +234,72 @@ def fetch_newest():
         if not info.get("hasNextPage") or not info.get("endCursor"):
             break
         cursor = info["endCursor"]
-    if not out and last_status not in (200, None):
-        raise RuntimeError(f"bina.az returned HTTP {last_status}")
     return out
 
 
+# --------------------------------------------------------------------------- #
+# Source 2: normal search web page (no signature needed; filters applied by site)
+# --------------------------------------------------------------------------- #
+def fetch_html():
+    """Read the search results page(s) and extract listing ids + links."""
+    found, seen_ids = [], set()
+    base = BINA_SEARCH_URL
+    for page in range(1, HTML_PAGES + 1):
+        url = base if page == 1 else base + ("&" if "?" in base else "?") + f"page={page}"
+        r = requests.get(url, headers=HTML_HEADERS, timeout=30)
+        if r.status_code != 200:
+            if page == 1:
+                raise RuntimeError(f"search page HTTP {r.status_code}")
+            break
+        text = r.text
+        matches_on_page = 0
+        for m in re.finditer(r'/items/(\d+)(-[A-Za-z0-9\-]+)?', text):
+            iid = m.group(1)
+            if iid in seen_ids:
+                continue
+            seen_ids.add(iid)
+            slug = m.group(2) or ""
+            title = slug.lstrip("-").replace("-", " ").strip() or None
+            found.append({
+                "id": int(iid), "url": "https://bina.az" + m.group(0),
+                "title": title, "html_only": True, "price": None, "rooms": None,
+                "area": None, "area_units": "m²", "floor": None, "floors": None,
+                "currency": "AZN", "location": None, "location_id": None,
+                "has_bill_of_sale": None, "has_mortgage": None, "has_repair": None,
+                "updated_at": None, "photo": None,
+            })
+            matches_on_page += 1
+        if matches_on_page == 0 and page == 1:
+            raise RuntimeError("search page had no listings (JS-only page or blocked)")
+        if matches_on_page == 0:
+            break
+    return found
+
+
+def fetch_listings():
+    """Return (listings, source_label). Raise RuntimeError if both sources fail."""
+    graphql_reason = None
+    try:
+        items = fetch_graphql()
+        if items:
+            return items, "API"
+        graphql_reason = "API returned 0 listings"
+    except PersistedQueryError as e:
+        graphql_reason = f"API signature expired ({e})"
+    except Exception as e:
+        graphql_reason = f"API: {e}"
+
+    log("Falling back to HTML page. Reason:", graphql_reason)
+    try:
+        items = fetch_html()
+        return items, f"web page (API unavailable: {graphql_reason})"
+    except Exception as e:
+        raise RuntimeError(f"{graphql_reason}; web page also failed: {e}")
+
+
+# --------------------------------------------------------------------------- #
+# State
+# --------------------------------------------------------------------------- #
 def load_state():
     if not os.path.exists(STATE_FILE):
         return None
@@ -251,6 +322,9 @@ def save_state(state):
         json.dump(state, fh, ensure_ascii=False, indent=1)
 
 
+# --------------------------------------------------------------------------- #
+# Messages
+# --------------------------------------------------------------------------- #
 def _fmt_published(iso):
     if not iso:
         return None
@@ -261,6 +335,15 @@ def _fmt_published(iso):
 
 
 def format_message(l):
+    if l.get("html_only"):
+        lines = ["🏠 <b>NEW APARTMENT FOUND</b>", ""]
+        if l.get("title"):
+            lines.append(f"📝 {html.escape(l['title'])}")
+        lines.append("")
+        lines.append(f'🔗 <a href="{html.escape(l["url"])}">Open listing</a>')
+        lines.append("<i>(open the link for price, photos and full details)</i>")
+        return "\n".join(lines)
+
     lines = ["🏠 <b>NEW APARTMENT FOUND</b>", ""]
     if l.get("price") is not None:
         lines.append(f"💰 <b>Price:</b> {l['price']:,} {l['currency']}")
@@ -275,13 +358,9 @@ def format_message(l):
     pub = _fmt_published(l.get("updated_at"))
     if pub:
         lines.append(f"📅 <b>Published:</b> {html.escape(pub)}")
-    tags = []
-    if l.get("has_bill_of_sale"):
-        tags.append("kupçalı")
-    if l.get("has_mortgage"):
-        tags.append("ipoteka")
-    if l.get("has_repair"):
-        tags.append("təmirli")
+    tags = [t for t, on in (("kupçalı", l.get("has_bill_of_sale")),
+                            ("ipoteka", l.get("has_mortgage")),
+                            ("təmirli", l.get("has_repair"))) if on]
     if tags:
         lines.append("✅ " + ", ".join(tags))
     lines.append("")
@@ -296,19 +375,23 @@ def notify(l):
     return tg_send_message(text)
 
 
-def process(newest, first_run, seen):
-    """Record listings; on later runs, notify new matches. Returns (seeded, notified)."""
+# --------------------------------------------------------------------------- #
+# Core
+# --------------------------------------------------------------------------- #
+def process(items, first_run, seen, source_is_html):
     now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
     f = build_filter(BINA_SEARCH_URL)
     new_matches, seeded, notified = [], 0, 0
 
-    for l in newest:
+    for l in items:
         idk = str(l["id"])
         if idk in seen:
             continue
-        if matches(l, f):
+        # HTML results are already filtered by the website; API results we filter here.
+        is_match = True if source_is_html else matches(l, f)
+        if is_match:
             if first_run:
-                seen[idk] = {"url": l["url"], "price": l["price"], "first_seen": now,
+                seen[idk] = {"url": l["url"], "price": l.get("price"), "first_seen": now,
                              "notification_sent": True, "matched": True}
                 seeded += 1
             else:
@@ -319,10 +402,10 @@ def process(newest, first_run, seen):
     if not first_run:
         for l in new_matches:
             if notify(l):
-                seen[str(l["id"])] = {"url": l["url"], "price": l["price"], "first_seen": now,
+                seen[str(l["id"])] = {"url": l["url"], "price": l.get("price"), "first_seen": now,
                                       "notification_sent": True, "matched": True}
                 notified += 1
-                log("Notified:", l["id"], l.get("price"), l.get("location"))
+                log("Notified:", l["id"], l.get("url"))
             else:
                 log("Send failed, will retry next run:", l["id"])
     return seeded, notified
@@ -339,43 +422,34 @@ def main():
         state = {"listings": {}}
     seen = state["listings"]
 
-    fetch_error = None
-    newest = []
     try:
-        newest = fetch_newest()
+        items, source = fetch_listings()
     except PersistedQueryError:
-        tg_send_message(
-            "⚠️ bina.az updated its site, so monitoring is paused until you refresh "
-            "the request signature (persisted query hash). Ask for the refresh steps.")
+        tg_send_message("⚠️ bina.az updated its site and the web-page fallback also failed. "
+                        "Tell me and I'll adjust the reader.")
         return
     except Exception as e:
-        fetch_error = str(e)
-        log("Fetch failed:", e)
-
-    # ---- FIRST RUN: always report back so you know the bot is alive ----------
-    if first_run:
-        if newest:
-            seeded, _ = process(newest, first_run=True, seen=seen)
-            save_state(state)
-            tg_send_message(
-                f"✅ <b>Monitoring started.</b>\nScanned {len(newest)} newest listings and "
-                f"recorded {seeded} that match your search. From now on you'll get a message "
-                f"only when a brand-new matching apartment appears.")
+        if first_run:
+            tg_send_message("🟡 <b>Bot is running</b>, but it could not read bina.az yet.\n"
+                            f"Reason: {html.escape(str(e))}\n"
+                            "It retries every 5 minutes. Send me this reason if it persists.")
         else:
-            tg_send_message(
-                "🟡 <b>Bot is running</b>, but it could not read bina.az on this attempt"
-                + (f"\nReason: {html.escape(fetch_error)}" if fetch_error else "")
-                + ".\nIt will automatically retry every 5 minutes. If this keeps happening, "
-                "tell me the reason shown above.")
+            log("Fetch failed on later run:", e)
         return
 
-    # ---- LATER RUNS ----------------------------------------------------------
-    if not newest:
-        log("Empty fetch on a later run; will retry next time.", fetch_error or "")
+    source_is_html = source.startswith("web page")
+
+    if first_run:
+        seeded, _ = process(items, True, seen, source_is_html)
+        save_state(state)
+        tg_send_message(f"✅ <b>Monitoring started</b> (via {html.escape(source)}).\n"
+                        f"Recorded {seeded} current listing(s). From now on you'll get a "
+                        f"message only when a brand-new matching apartment appears.")
         return
-    _, notified = process(newest, first_run=False, seen=seen)
+
+    _, notified = process(items, False, seen, source_is_html)
     save_state(state)
-    log(f"Done. scanned={len(newest)} notified={notified} seen_total={len(seen)}")
+    log(f"Done via {source}. scanned={len(items)} notified={notified} seen_total={len(seen)}")
 
 
 if __name__ == "__main__":
