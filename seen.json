@@ -663,6 +663,55 @@
    "first_seen": "2026-08-12T06:45:30+00:00",
    "notification_sent": true,
    "matched": true
+  },
+  "6062963": {
+   "url": "https://bina.az/items/6062963",
+   "price": 180000,
+   "first_seen": "2026-08-12T07:03:27+00:00",
+   "notification_sent": true,
+   "matched": true
+  },
+  "6203593": {
+   "url": "https://bina.az/items/6203593",
+   "price": 190000,
+   "first_seen": "2026-08-12T07:03:27+00:00",
+   "notification_sent": true,
+   "matched": true
+  },
+  "6286777": {
+   "url": "https://bina.az/items/6286777",
+   "price": 153000,
+   "first_seen": "2026-08-12T07:03:27+00:00",
+   "notification_sent": true,
+   "matched": true
+  },
+  "6239458": {
+   "url": "https://bina.az/items/6239458",
+   "price": 168000,
+   "first_seen": "2026-08-12T07:03:27+00:00",
+   "notification_sent": true,
+   "matched": true
+  },
+  "6368939": {
+   "url": "https://bina.az/items/6368939",
+   "price": 169500,
+   "first_seen": "2026-08-12T07:03:27+00:00",
+   "notification_sent": true,
+   "matched": true
+  },
+  "6368908": {
+   "url": "https://bina.az/items/6368908",
+   "price": 169000,
+   "first_seen": "2026-08-12T07:03:27+00:00",
+   "notification_sent": true,
+   "matched": true
+  },
+  "6368912": {
+   "url": "https://bina.az/items/6368912",
+   "price": 152000,
+   "first_seen": "2026-08-12T07:03:27+00:00",
+   "notification_sent": true,
+   "matched": true
   }
  }
 }
